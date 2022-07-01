@@ -1,0 +1,251 @@
+---
+title: "Home Appraisals"
+author: "Nick Hass"
+date: "4/8/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(nlme) # for gls
+library(gstat) # for variogram
+source("glstools-master/stdres.gls.R")
+source("glstools-master/predictgls.R")
+```
+
+
+
+Which variance function should we use to describe the heteroskedasticity?
+Exponential correlation function!!
+Bigger homes are more variable in price than smaller homes.
+
+Spatial Linear Model $Y \sim N(X\beta, \sigma^2R)$
+
+Change the values of the diagonal based on a covariate (living area!!!!!!!!!!)
+
+Questions:
+- Should we make House.Style, Central.Air and factor variables? What about Garage.Cars, Full.Bath, Half.Bath, and Bedroom.AbvGr ?
+
+```{r}
+homes <- read_csv("HousingPrices.csv")
+
+# Identify factor variables -- I found that using too many breaks the gls
+homes$House.Style <- as.factor(homes$House.Style)
+homes$Central.Air <- as.factor(homes$Central.Air)
+# homes$Garage.Cars <- as.factor(homes$Garage.Cars)
+# homes$Full.Bath <- as.factor(homes$Full.Bath)
+# homes$Half.Bath <- as.factor(homes$Half.Bath)
+# homes$Bedroom.AbvGr <- as.factor(homes$Bedroom.AbvGr)
+
+# Separate into data set with and without missing values
+homes_na <- homes %>% filter(is.na(Price))
+homes_no_na <- homes %>% filter(!is.na(Price))
+```
+
+## EDA, outliers? transformations?
+
+```{r}
+# It looks like as living area grows, price becomes more variable.
+par(mfrow = c(2,2))
+ggplot(homes_no_na, mapping = aes(x = Gr.Liv.Area, y = Price)) +
+  geom_point() +
+  labs(title = "Price by Living Area",
+       x = "Living Area (sq feet)")
+
+# Newer homes tend to be more expensive
+ggplot(homes_no_na, mapping = aes(x = Year.Remod.Add, y = Price)) +
+  geom_point() +
+  labs(title = "Price by Remodel Date",
+       x = "Year of Remodel")
+
+ggplot(homes_no_na, mapping = aes(x = Central.Air, y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by Central Air",
+       x = "Central Air") +
+  scale_x_discrete(labels = c("N" = "No", "Y" = "Yes"))
+
+ggplot(homes_no_na, mapping = aes(x = House.Style, y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by House Style",
+       x = "House Style") +
+  scale_x_discrete(labels = c("1Story" = "1 Story", "2Story" = "2 Story",
+                              "SLvl" = "Split Level"))
+### ***update x axis labels for these plots***
+
+# Larger garages tend to be more expensive homes
+ggplot(homes_no_na, mapping = aes(x = as.factor(Garage.Cars), y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by Size of Garage",
+       x = "Size of Garage in Car Capacity")
+
+ggplot(homes_no_na, mapping = aes(x = as.factor(Half.Bath), y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by Number of Half Bathrooms",
+       x = "Half Bathrooms")
+
+ggplot(homes_no_na, mapping = aes(x = as.factor(Full.Bath), y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by Number of Full Bathrooms",
+       x = "Full Bathrooms")
+
+ggplot(homes_no_na, mapping = aes(x = as.factor(Bedroom.AbvGr), y = Price)) +
+  geom_boxplot() +
+  labs(title = "Price by Number of Bedrooms",
+       x = "Bedrooms")
+
+```
+
+
+## Model Specification
+
+MLR with Spatial Correlation Structure & Exponential Variance (Heteroskedasticity)
+
+$$
+Y \sim N(X\beta, \Sigma)
+$$
+
+$$
+\Sigma = DRD
+$$
+
+$$
+D = diag(\sigma_1, ..., \sigma_n)
+$$
+
+$$
+R = \text{Correlation Matrix}
+$$
+
+## Model Fitting
+
+Simple Model
+```{r}
+homes.lm <- lm(Price ~ ., data = homes_no_na)
+BIC(homes.lm)
+
+myVariogram <- variogram(object = Price ~ Gr.Liv.Area + House.Style + 
+                                  Year.Remod.Add + Central.Air + Full.Bath + 
+                                  Half.Bath + Bedroom.AbvGr + Garage.Cars,
+                         locations = ~Lon + Lat, 
+                         data = homes_no_na)
+
+plot(myVariogram, main = "Variogram of the Residuals") # There is spatial correlation.
+```
+
+
+Correlation
+```{r}
+homes.lm.hetero <- gls(model = Price ~ Gr.Liv.Area + House.Style + 
+                               Year.Remod.Add + Central.Air + Full.Bath + 
+                               Half.Bath + Bedroom.AbvGr + Garage.Cars, 
+    data=homes_no_na,  # data without missing values
+    weights = varExp(form=~Gr.Liv.Area), # D part (Heteroskedastic)
+    correlation = corExp(form = ~Lat+Lon, nugget = TRUE), # R part (Spatial corr)
+    method="ML") ## with factor central air and house style
+
+AIC(homes.lm.hetero)
+```
+
+## Model Validation
+
+```{r, fig.cap = "Model Validation Plots", figures-side, fig.show="hold", out.width="50%"}
+# Spatial MLR Model with heteroskedasticity: homes.lm.hetero
+
+# Linearity: avPlots
+car::avPlots(homes.lm, main = "Check for Linearity")
+
+# Independence by decorrelating residuals and looking at the variogram of decorrelated residuals.
+sres <- stdres.gls(homes.lm.hetero) # Decorrelate residuals
+residDF <- data.frame(Lon=homes_no_na$Lon, Lat=homes_no_na$Lat, decorrResid=sres)
+residVariogram <- variogram(object=decorrResid~1, locations=~Lon+Lat, data=residDF)
+plot(residVariogram, main = "Variogram of the Standardized Decorrelated Residuals")
+
+#  Normality: Histogram of standardized decorrelated residuals
+hist(sres, probability = TRUE, ylim = c(0, 0.4), xlim = c(-5, 5),
+     main = "Standardized Decorrelated Residuals")
+curve(dnorm(x), add = TRUE, col = "blue") # Normality holds
+
+# Equal Variance: Fitted values vs. Standardized and decorrelated residuals plot
+fitted_values <- fitted(homes.lm.hetero)
+ggplot(homes_no_na, aes(x = fitted_values, y = sres)) +
+  geom_point() + ggtitle("Equal Variance Check") # Equal variance holds
+```
+As shown by the added-variable plots, linearity holds.
+
+After accounting for spatial correlation by using a spatial correlation function, independence holds, as shown by the variogram of the standardized and decorrelated residuals.
+
+As shown by the histogram of standardized and decorrelated residuals, normality holds.
+
+After accounting for heteroskedacity by using a exponential variance function, equal variance holds, as shown by the fitted values by standardized and decorrelated residuals plot.
+
+## Statistical Inference
+```{r}
+
+```
+
+Steps:
+EDA
+Model Specification
+Model Fitting
+Model Validation
+Statistical Inference
+
+
+Q1: How well do the home characteristics explain sale price?
+```{r}
+cor(homes_no_na$Price, fitted_values)^2  # Pseudo R squared = 0.9329216
+```
+
+A1: Home characteristics explain 93.29216% of the variability in home prices.
+
+Q2: What factors increase the sale price of a home?
+```{r}
+homes.lm.hetero$coefficients > 0
+```
+
+A2: Above ground living area, Split level homes, newer remodels, having central air, more half bathrooms, and larger sized garages increase the sale price of a home.
+
+Q3: Does the variability of sale price increase with the size of the home (as given by living area)?
+```{r}
+# This plot is also seen in the EDA
+ggplot(homes_no_na, mapping = aes(x = Gr.Liv.Area, y = Price)) +
+  geom_point() +
+  labs(title = "Price by Living Area")
+```
+
+A3: Yes, as can be seen from this histogram, as living area increases, there is a larger range of home prices.
+
+Q4: What is your predicted/appraised sale price for the homes in the dataset that do not have a saleprice? Include your predictions in a map
+```{r}
+missingPreds <- predictgls(homes.lm.hetero, newdframe = homes_na, level = 0.95)  # predict for missing values, save df
+not_misssing_preds <- predictgls(homes.lm.hetero, newdframe = homes_no_na)
+
+homes_na$Price <- missingPreds$Prediction
+
+full <- rbind(homes_no_na, homes_na)  # full <- rbind(missing, without missing)
+
+
+ggplot(data = homes, aes(x = Lon, y = Lat)) +
+  geom_point(aes(col = Price), size = 2.5) +
+  scale_color_distiller(palette = "Spectral", na.value = NA) +
+  labs(title = "Home Price Data") +
+  theme_bw()
+
+# ggplot(data = full, aes(x = Lon, y = Lat)) + 
+#   geom_point(aes(col = Price), size = 2.5) +
+#   scale_color_distiller(palette = "Spectral", na.value = NA) +
+#   labs(title = "Home Price Predictions")
+options(scipen=999)
+#options(scipen=0, digits=7)
+ggplot(mapping = aes(x = Lon, y = Lat)) + 
+  geom_point(data = full[1:465,], aes(col = Price), size = 2.5, alpha = 0.5) +
+  geom_point(data = full[466:517,], aes(col = Price), size = 2.5, shape = 13,
+             alpha = 1) +
+  theme_dark() +
+  scale_color_distiller(palette = "Spectral", na.value = NA) +
+  labs(title = "Home Price Predictions with Original Data",
+       subtitle = "Predictions Marked with Target Shaped Points") +
+  scale_fill_continuous(labels=scales::comma)
+
+```
